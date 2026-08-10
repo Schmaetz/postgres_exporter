@@ -11,13 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package exporter
 
 import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"regexp"
@@ -26,6 +27,19 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+// Metric name parts.
+const (
+	// Namespace for all metrics.
+	namespace = "pg"
+	// Subsystems.
+	exporter = "exporter"
+	// Metric label used for static string data thats handy to send to Prometheus
+	// e.g. version
+	staticLabelName = "static"
+	// Metric label used for server identification.
+	serverLabelName = "server"
 )
 
 // ColumnUsage should be one of several enum values which describe how a
@@ -142,17 +156,9 @@ func (e *ErrorConnectToServer) Error() string {
 }
 
 // TODO: revisit this with the semver system
-func dumpMaps() {
+func DumpMaps() {
 	// TODO: make this function part of the exporter
-	for name, cmap := range builtinMetricMaps {
-		query, ok := queryOverrides[name]
-		if !ok {
-			fmt.Println(name)
-		} else {
-			for _, queryOverride := range query {
-				fmt.Println(name, queryOverride.versionRange, queryOverride.query)
-			}
-		}
+	for _, cmap := range builtinMetricMaps {
 
 		for column, details := range cmap.columnMappings {
 			fmt.Printf("  %-40s %v\n", column, details)
@@ -175,98 +181,16 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 		true,
 		0,
 	},
-	"pg_stat_replication": {
-		map[string]ColumnMapping{
-			"procpid":                  {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
-			"pid":                      {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
-			"usesysid":                 {DISCARD, "OID of the user logged into this WAL sender process", nil, nil},
-			"usename":                  {DISCARD, "Name of the user logged into this WAL sender process", nil, nil},
-			"application_name":         {LABEL, "Name of the application that is connected to this WAL sender", nil, nil},
-			"client_addr":              {LABEL, "IP address of the client connected to this WAL sender. If this field is null, it indicates that the client is connected via a Unix socket on the server machine.", nil, nil},
-			"client_hostname":          {DISCARD, "Host name of the connected client, as reported by a reverse DNS lookup of client_addr. This field will only be non-null for IP connections, and only when log_hostname is enabled.", nil, nil},
-			"client_port":              {DISCARD, "TCP port number that the client is using for communication with this WAL sender, or -1 if a Unix socket is used", nil, nil},
-			"backend_start":            {DISCARD, "with time zone	Time when this process was started, i.e., when the client connected to this WAL sender", nil, nil},
-			"backend_xmin":             {DISCARD, "The current backend's xmin horizon.", nil, nil},
-			"state":                    {LABEL, "Current WAL sender state", nil, nil},
-			"sent_location":            {DISCARD, "Last transaction log position sent on this connection", nil, semver.MustParseRange("<10.0.0")},
-			"write_location":           {DISCARD, "Last transaction log position written to disk by this standby server", nil, semver.MustParseRange("<10.0.0")},
-			"flush_location":           {DISCARD, "Last transaction log position flushed to disk by this standby server", nil, semver.MustParseRange("<10.0.0")},
-			"replay_location":          {DISCARD, "Last transaction log position replayed into the database on this standby server", nil, semver.MustParseRange("<10.0.0")},
-			"sent_lsn":                 {DISCARD, "Last transaction log position sent on this connection", nil, semver.MustParseRange(">=10.0.0")},
-			"write_lsn":                {DISCARD, "Last transaction log position written to disk by this standby server", nil, semver.MustParseRange(">=10.0.0")},
-			"flush_lsn":                {DISCARD, "Last transaction log position flushed to disk by this standby server", nil, semver.MustParseRange(">=10.0.0")},
-			"replay_lsn":               {DISCARD, "Last transaction log position replayed into the database on this standby server", nil, semver.MustParseRange(">=10.0.0")},
-			"sync_priority":            {DISCARD, "Priority of this standby server for being chosen as the synchronous standby", nil, nil},
-			"sync_state":               {DISCARD, "Synchronous state of this standby server", nil, nil},
-			"slot_name":                {LABEL, "A unique, cluster-wide identifier for the replication slot", nil, semver.MustParseRange(">=9.2.0")},
-			"plugin":                   {DISCARD, "The base name of the shared object containing the output plugin this logical slot is using, or null for physical slots", nil, nil},
-			"slot_type":                {DISCARD, "The slot type - physical or logical", nil, nil},
-			"datoid":                   {DISCARD, "The OID of the database this slot is associated with, or null. Only logical slots have an associated database", nil, nil},
-			"database":                 {DISCARD, "The name of the database this slot is associated with, or null. Only logical slots have an associated database", nil, nil},
-			"active":                   {DISCARD, "True if this slot is currently actively being used", nil, nil},
-			"active_pid":               {DISCARD, "Process ID of a WAL sender process", nil, nil},
-			"xmin":                     {DISCARD, "The oldest transaction that this slot needs the database to retain. VACUUM cannot remove tuples deleted by any later transaction", nil, nil},
-			"catalog_xmin":             {DISCARD, "The oldest transaction affecting the system catalogs that this slot needs the database to retain. VACUUM cannot remove catalog tuples deleted by any later transaction", nil, nil},
-			"restart_lsn":              {DISCARD, "The address (LSN) of oldest WAL which still might be required by the consumer of this slot and thus won't be automatically removed during checkpoints", nil, nil},
-			"pg_current_xlog_location": {DISCARD, "pg_current_xlog_location", nil, nil},
-			"pg_current_wal_lsn":       {DISCARD, "pg_current_xlog_location", nil, semver.MustParseRange(">=10.0.0")},
-			"pg_current_wal_lsn_bytes": {GAUGE, "WAL position in bytes", nil, semver.MustParseRange(">=10.0.0")},
-			"pg_xlog_location_diff":    {GAUGE, "Lag in bytes between master and slave", nil, semver.MustParseRange(">=9.2.0 <10.0.0")},
-			"pg_wal_lsn_diff":          {GAUGE, "Lag in bytes between master and slave", nil, semver.MustParseRange(">=10.0.0")},
-			"confirmed_flush_lsn":      {DISCARD, "LSN position a consumer of a slot has confirmed flushing the data received", nil, nil},
-			"write_lag":                {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written it (but not yet flushed it or applied it). This can be used to gauge the delay that synchronous_commit level remote_write incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
-			"flush_lag":                {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written and flushed it (but not yet applied it). This can be used to gauge the delay that synchronous_commit level remote_flush incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
-			"replay_lag":               {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written, flushed and applied it. This can be used to gauge the delay that synchronous_commit level remote_apply incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
-		},
-		true,
-		0,
-	},
-	"pg_replication_slots": {
-		map[string]ColumnMapping{
-			"slot_name":       {LABEL, "Name of the replication slot", nil, nil},
-			"database":        {LABEL, "Name of the database", nil, nil},
-			"active":          {GAUGE, "Flag indicating if the slot is active", nil, nil},
-			"pg_wal_lsn_diff": {GAUGE, "Replication lag in bytes", nil, nil},
-		},
-		true,
-		0,
-	},
-	"pg_stat_archiver": {
-		map[string]ColumnMapping{
-			"archived_count":     {COUNTER, "Number of WAL files that have been successfully archived", nil, nil},
-			"last_archived_wal":  {DISCARD, "Name of the last WAL file successfully archived", nil, nil},
-			"last_archived_time": {DISCARD, "Time of the last successful archive operation", nil, nil},
-			"failed_count":       {COUNTER, "Number of failed attempts for archiving WAL files", nil, nil},
-			"last_failed_wal":    {DISCARD, "Name of the WAL file of the last failed archival operation", nil, nil},
-			"last_failed_time":   {DISCARD, "Time of the last failed archival operation", nil, nil},
-			"stats_reset":        {DISCARD, "Time at which these statistics were last reset", nil, nil},
-			"last_archive_age":   {GAUGE, "Time in seconds since last WAL segment was successfully archived", nil, nil},
-		},
-		true,
-		0,
-	},
-	"pg_stat_activity": {
-		map[string]ColumnMapping{
-			"datname":          {LABEL, "Name of this database", nil, nil},
-			"state":            {LABEL, "connection state", nil, semver.MustParseRange(">=9.2.0")},
-			"usename":          {LABEL, "connection usename", nil, nil},
-			"application_name": {LABEL, "connection application_name", nil, nil},
-			"count":            {GAUGE, "number of connections in this state", nil, nil},
-			"max_tx_duration":  {GAUGE, "max duration in seconds any active transaction has been running", nil, nil},
-		},
-		true,
-		0,
-	},
 }
 
 // Turn the MetricMap column mapping into a prometheus descriptor mapping.
-func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metricMaps map[string]intermediateMetricMap) map[string]MetricMapNamespace {
+func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metricMaps map[string]intermediateMetricMap, logger *slog.Logger, metricPrefix string) map[string]MetricMapNamespace {
 	var metricMap = make(map[string]MetricMapNamespace)
 
 	for namespace, intermediateMappings := range metricMaps {
 		thisMap := make(map[string]MetricMap)
 
-		namespace = strings.Replace(namespace, "pg", *metricPrefix, 1)
+		namespace = strings.Replace(namespace, "pg", metricPrefix, 1)
 
 		// Get the constant labels
 		var variableLabels []string
@@ -309,7 +233,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 					vtype: prometheus.CounterValue,
 					desc:  prometheus.NewDesc(fmt.Sprintf("%s_%s", namespace, columnName), columnMapping.description, variableLabels, serverLabels),
 					conversion: func(in interface{}) (float64, bool) {
-						return dbToFloat64(in)
+						return dbToFloat64(in, logger)
 					},
 				}
 			case GAUGE:
@@ -317,7 +241,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 					vtype: prometheus.GaugeValue,
 					desc:  prometheus.NewDesc(fmt.Sprintf("%s_%s", namespace, columnName), columnMapping.description, variableLabels, serverLabels),
 					conversion: func(in interface{}) (float64, bool) {
-						return dbToFloat64(in)
+						return dbToFloat64(in, logger)
 					},
 				}
 			case HISTOGRAM:
@@ -326,7 +250,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 					vtype:     prometheus.UntypedValue,
 					desc:      prometheus.NewDesc(fmt.Sprintf("%s_%s", namespace, columnName), columnMapping.description, variableLabels, serverLabels),
 					conversion: func(in interface{}) (float64, bool) {
-						return dbToFloat64(in)
+						return dbToFloat64(in, logger)
 					},
 				}
 				thisMap[columnName+"_bucket"] = MetricMap{
@@ -406,7 +330,7 @@ type Exporter struct {
 	// only, since it just points to the global.
 	builtinMetricMaps map[string]intermediateMetricMap
 
-	disableDefaultMetrics, disableSettingsMetrics, autoDiscoverDatabases bool
+	disableDefaultMetrics, autoDiscoverDatabases bool
 
 	excludeDatabases []string
 	includeDatabases []string
@@ -422,6 +346,9 @@ type Exporter struct {
 	// servers are used to allow re-using the DB connection between scrapes.
 	// servers contains metrics map and query overrides.
 	servers *Servers
+
+	logger       *slog.Logger
+	metricPrefix string
 }
 
 // ExporterOpt configures Exporter.
@@ -431,13 +358,6 @@ type ExporterOpt func(*Exporter)
 func DisableDefaultMetrics(b bool) ExporterOpt {
 	return func(e *Exporter) {
 		e.disableDefaultMetrics = b
-	}
-}
-
-// DisableSettingsMetrics configures pg_settings export.
-func DisableSettingsMetrics(b bool) ExporterOpt {
-	return func(e *Exporter) {
-		e.disableSettingsMetrics = b
 	}
 }
 
@@ -474,11 +394,18 @@ func WithUserQueriesPath(p string) ExporterOpt {
 // WithConstantLabels configures constant labels.
 func WithConstantLabels(s string) ExporterOpt {
 	return func(e *Exporter) {
-		e.constantLabels = parseConstLabels(s)
+		e.constantLabels = parseConstLabels(s, e.logger)
 	}
 }
 
-func parseConstLabels(s string) prometheus.Labels {
+// WithMetricPrefix configures metric prefix.
+func WithMetricPrefix(prefix string) ExporterOpt {
+	return func(e *Exporter) {
+		e.metricPrefix = prefix
+	}
+}
+
+func parseConstLabels(s string, logger *slog.Logger) prometheus.Labels {
 	labels := make(prometheus.Labels)
 
 	s = strings.TrimSpace(s)
@@ -505,10 +432,11 @@ func parseConstLabels(s string) prometheus.Labels {
 }
 
 // NewExporter returns a new PostgreSQL exporter for the provided DSN.
-func NewExporter(dsn []string, opts ...ExporterOpt) *Exporter {
+func NewExporter(dsn []string, logger *slog.Logger, opts ...ExporterOpt) *Exporter {
 	e := &Exporter{
 		dsn:               dsn,
 		builtinMetricMaps: builtinMetricMaps,
+		logger:            logger,
 	}
 
 	for _, opt := range opts {
@@ -516,7 +444,7 @@ func NewExporter(dsn []string, opts ...ExporterOpt) *Exporter {
 	}
 
 	e.setupInternalMetrics()
-	e.servers = NewServers(ServerWithLabels(e.constantLabels))
+	e.servers = NewServers(ServerWithLabels(e.constantLabels), ServerWithLogger(e.logger))
 
 	return e
 }
@@ -573,14 +501,11 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.userQueriesError.Collect(ch)
 }
 
-func newDesc(subsystem, name, help string, labels prometheus.Labels) *prometheus.Desc {
-	return prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, subsystem, name),
-		help, nil, labels,
-	)
+func (e *Exporter) CloseServers() {
+	e.servers.Close()
 }
 
-func checkPostgresVersion(db *sql.DB, server string) (semver.Version, string, error) {
+func checkPostgresVersion(db *sql.DB, server string, logger *slog.Logger) (semver.Version, string, error) {
 	logger.Debug("Querying PostgreSQL version", "server", server)
 	versionRow := db.QueryRow("SELECT version();")
 	var versionString string
@@ -598,24 +523,24 @@ func checkPostgresVersion(db *sql.DB, server string) (semver.Version, string, er
 
 // Check and update the exporters query maps if the version has changed.
 func (e *Exporter) checkMapVersions(ch chan<- prometheus.Metric, server *Server) error {
-	semanticVersion, versionString, err := checkPostgresVersion(server.db, server.String())
+	semanticVersion, versionString, err := checkPostgresVersion(server.db, server.String(), e.logger)
 	if err != nil {
 		return fmt.Errorf("Error fetching version string on %q: %v", server, err)
 	}
 
 	if !e.disableDefaultMetrics && semanticVersion.LT(lowestSupportedVersion) {
-		logger.Warn("PostgreSQL version is lower than our lowest supported version", "server", server, "version", semanticVersion, "lowest_supported_version", lowestSupportedVersion)
+		e.logger.Warn("PostgreSQL version is lower than our lowest supported version", "server", server, "version", semanticVersion, "lowest_supported_version", lowestSupportedVersion)
 	}
 
 	// Check if semantic version changed and recalculate maps if needed.
 	if semanticVersion.NE(server.lastMapVersion) || server.metricMap == nil {
-		logger.Info("Semantic version changed", "server", server, "from", server.lastMapVersion, "to", semanticVersion)
+		e.logger.Info("Semantic version changed", "server", server, "from", server.lastMapVersion, "to", semanticVersion)
 		server.mappingMtx.Lock()
 
 		// Get Default Metrics only for master database
 		if !e.disableDefaultMetrics && server.master {
-			server.metricMap = makeDescMap(semanticVersion, server.labels, e.builtinMetricMaps)
-			server.queryOverrides = makeQueryOverrideMap(semanticVersion, queryOverrides)
+			server.metricMap = makeDescMap(semanticVersion, server.labels, e.builtinMetricMaps, server.logger, e.metricPrefix)
+			server.queryOverrides = make(map[string]string)
 		} else {
 			server.metricMap = make(map[string]MetricMapNamespace)
 			server.queryOverrides = make(map[string]string)
@@ -630,13 +555,13 @@ func (e *Exporter) checkMapVersions(ch chan<- prometheus.Metric, server *Server)
 			// Calculate the hashsum of the useQueries
 			userQueriesData, err := os.ReadFile(e.userQueriesPath)
 			if err != nil {
-				logger.Error("Failed to reload user queries", "path", e.userQueriesPath, "err", err)
+				e.logger.Error("Failed to reload user queries", "path", e.userQueriesPath, "err", err)
 				e.userQueriesError.WithLabelValues(e.userQueriesPath, "").Set(1)
 			} else {
 				hashsumStr := fmt.Sprintf("%x", sha256.Sum256(userQueriesData))
 
-				if err := addQueries(userQueriesData, semanticVersion, server); err != nil {
-					logger.Error("Failed to reload user queries", "path", e.userQueriesPath, "err", err)
+				if err := addQueries(userQueriesData, semanticVersion, server, e.metricPrefix); err != nil {
+					e.logger.Error("Failed to reload user queries", "path", e.userQueriesPath, "err", err)
 					e.userQueriesError.WithLabelValues(e.userQueriesPath, hashsumStr).Set(1)
 				} else {
 					// Mark user queries as successfully loaded
@@ -678,7 +603,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		if err := e.scrapeDSN(ch, dsn); err != nil {
 			errorsCount++
 
-			logger.Error("error scraping dsn", "err", err, "dsn", dsn)
+			e.logger.Error("error scraping dsn", "err", err, "dsn", loggableDSN(dsn))
 
 			if _, ok := err.(*ErrorConnectToServer); ok {
 				connectionErrorsCount++

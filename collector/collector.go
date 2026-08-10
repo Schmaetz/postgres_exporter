@@ -15,6 +15,7 @@ package collector
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,8 +38,9 @@ const (
 	// Namespace for all metrics.
 	namespace = "pg"
 
-	defaultEnabled  = true
-	defaultDisabled = false
+	collectorFlagPrefix = "collector."
+	defaultEnabled      = true
+	defaultDisabled     = false
 )
 
 var (
@@ -74,7 +76,7 @@ func registerCollector(name string, isDefaultEnabled bool, createFunc func(colle
 	}
 
 	// Create flag for this collector
-	flagName := fmt.Sprintf("collector.%s", name)
+	flagName := collectorFlagPrefix + name
 	flagHelp := fmt.Sprintf("Enable the %s collector (default: %s).", name, helpDefaultState)
 	defaultValue := fmt.Sprintf("%v", isDefaultEnabled)
 
@@ -90,7 +92,8 @@ type PostgresCollector struct {
 	Collectors map[string]Collector
 	logger     *slog.Logger
 
-	instance *instance
+	instance          *instance
+	CollectionTimeout time.Duration
 }
 
 type Option func(*PostgresCollector) error
@@ -156,6 +159,20 @@ func NewPostgresCollector(logger *slog.Logger, excludeDatabases []string, dsn st
 	return p, nil
 }
 
+func WithCollectionTimeout(s string) Option {
+	return func(e *PostgresCollector) error {
+		duration, err := time.ParseDuration(s)
+		if err != nil {
+			return err
+		}
+		if duration < 1*time.Millisecond {
+			return errors.New("timeout must be greater than 1ms")
+		}
+		e.CollectionTimeout = duration
+		return nil
+	}
+}
+
 // Describe implements the prometheus.Collector interface.
 func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- scrapeDurationDesc
@@ -164,18 +181,23 @@ func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements the prometheus.Collector interface.
 func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
-	ctx := context.TODO()
-
 	// copy the instance so that concurrent scrapes have independent instances
 	inst := p.instance.copy()
 
 	// Set up the database connection for the collector.
 	err := inst.setup()
+	defer inst.Close()
 	if err != nil {
 		p.logger.Error("Error opening connection to database", "err", err)
 		return
 	}
-	defer inst.Close()
+	p.collectFromConnection(inst, ch)
+}
+
+func (p PostgresCollector) collectFromConnection(inst *instance, ch chan<- prometheus.Metric) {
+	// Eventually, connect this to the http scraping context
+	ctx, cancel := context.WithTimeout(context.Background(), p.CollectionTimeout)
+	defer cancel()
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(p.Collectors))
@@ -186,6 +208,10 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		}(name, c)
 	}
 	wg.Wait()
+}
+
+func (p *PostgresCollector) Close() error {
+	return p.instance.Close()
 }
 
 func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger *slog.Logger) {
@@ -226,4 +252,12 @@ var ErrNoData = errors.New("collector returned no data")
 
 func IsNoDataError(err error) bool {
 	return err == ErrNoData
+}
+
+func Int32(m sql.NullInt32) float64 {
+	mM := 0.0
+	if m.Valid {
+		mM = float64(m.Int32)
+	}
+	return mM
 }

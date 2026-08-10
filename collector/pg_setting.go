@@ -1,4 +1,4 @@
-// Copyright 2021 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -11,10 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package collector
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
 	"strings"
@@ -22,55 +24,74 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const settingsSubsystem = "settings"
+
+func init() {
+	registerCollector(settingsSubsystem, defaultEnabled, NewPGSettingsCollector)
+}
+
+type PGSettingsCollector struct {
+	log *slog.Logger
+}
+
+func NewPGSettingsCollector(config collectorConfig) (Collector, error) {
+	return &PGSettingsCollector{log: config.logger}, nil
+}
+
 var (
 	settingUnits = []string{
 		"ms", "s", "min", "h", "d",
 		"B", "kB", "MB", "GB", "TB",
 	}
-)
-
-// Query the pg_settings view containing runtime variables
-func querySettings(ch chan<- prometheus.Metric, server *Server) error {
-	logger.Debug("Querying pg_setting view", "server", server)
 
 	// pg_settings docs: https://www.postgresql.org/docs/current/static/view-pg-settings.html
 	//
 	// NOTE: If you add more vartypes here, you must update the supported
-	// types in normaliseUnit() below
-	query := "SELECT name, setting, COALESCE(unit, ''), short_desc, vartype FROM pg_settings WHERE vartype IN ('bool', 'integer', 'real') AND name != 'sync_commit_cancel_wait';"
+	// types in normaliseUnit() below.
+	//
+	// Settings intentionally ignored due to invalid format:
+	// - `sync_commit_cancel_wait`, specific to Azure Postgres, see https://github.com/prometheus-community/postgres_exporter/issues/523
+	// - `google_dataplex.max_messages`, specific to Google Cloud SQL, see https://github.com/prometheus-community/postgres_exporter/issues/1240
+	pgSettingsQuery = "SELECT name, setting, COALESCE(unit, ''), COALESCE(short_desc, ''), vartype FROM pg_settings WHERE vartype IN ('bool', 'integer', 'real') AND name NOT IN ('sync_commit_cancel_wait', 'google_dataplex.max_messages');"
+)
 
-	rows, err := server.db.Query(query)
+// Update implements Collector and exposes PostgreSQL runtime settings.
+func (c PGSettingsCollector) Update(ctx context.Context, instance *instance, ch chan<- prometheus.Metric) error {
+	db := instance.getDB()
+	rows, err := db.QueryContext(ctx, pgSettingsQuery)
 	if err != nil {
-		return fmt.Errorf("Error running query on database %q: %s %v", server, namespace, err)
+		return err
 	}
-	defer rows.Close() // nolint: errcheck
+	defer rows.Close()
 
 	for rows.Next() {
 		s := &pgSetting{}
-		err = rows.Scan(&s.name, &s.setting, &s.unit, &s.shortDesc, &s.vartype)
-		if err != nil {
-			return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
+		if err := rows.Scan(&s.name, &s.setting, &s.unit, &s.shortDesc, &s.vartype); err != nil {
+			return err
 		}
-
-		ch <- s.metric(server.labels)
+		metric, err := s.metric()
+		if err != nil {
+			c.log.Warn("Error normalising unit for setting", "setting", s.name, "value", s.setting, "unit", s.unit, "error", err)
+			continue
+		}
+		ch <- metric
 	}
 
-	return nil
+	return rows.Err()
 }
 
-// pgSetting is represents a PostgreSQL runtime variable as returned by the
+// pgSetting represents a PostgreSQL runtime variable as returned by the
 // pg_settings view.
 type pgSetting struct {
 	name, setting, unit, shortDesc, vartype string
 }
 
-func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
+func (s *pgSetting) metric() (prometheus.Metric, error) {
 	var (
 		err       error
-		name      = strings.Replace(s.name, ".", "_", -1)
+		name      = strings.ReplaceAll(strings.ReplaceAll(s.name, ".", "_"), "-", "_")
 		unit      = s.unit // nolint: ineffassign
 		shortDesc = fmt.Sprintf("Server Parameter: %s", s.name)
-		subsystem = "settings"
 		val       float64
 	)
 
@@ -81,9 +102,7 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 		}
 	case "integer", "real":
 		if val, unit, err = s.normaliseUnit(); err != nil {
-			// Panic, since we should recognise all units
-			// and don't want to silently exlude metrics
-			panic(err)
+			return nil, err
 		}
 
 		if len(unit) > 0 {
@@ -91,12 +110,11 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 			shortDesc = fmt.Sprintf("%s [Units converted to %s.]", shortDesc, unit)
 		}
 	default:
-		// Panic because we got a type we didn't ask for
-		panic(fmt.Sprintf("Unsupported vartype %q", s.vartype))
+		return nil, fmt.Errorf("pgsetting: unsupported vartype %q", s.vartype)
 	}
 
-	desc := newDesc(subsystem, name, shortDesc, labels)
-	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+	desc := prometheus.NewDesc(prometheus.BuildFQName(namespace, settingsSubsystem, name), shortDesc, nil, nil)
+	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val), nil
 }
 
 // Removes units from any of the setting values.
@@ -119,7 +137,7 @@ func (s *pgSetting) normaliseUnit() (val float64, unit string, err error) {
 
 	val, err = strconv.ParseFloat(s.setting, 64)
 	if err != nil {
-		return val, unit, fmt.Errorf("Error converting setting %q value %q to float: %s", s.name, s.setting, err)
+		return val, unit, fmt.Errorf("error converting setting %q value %q to float: %s", s.name, s.setting, err)
 	}
 
 	// Units defined in: https://www.postgresql.org/docs/current/static/config-setting.html
@@ -131,7 +149,7 @@ func (s *pgSetting) normaliseUnit() (val float64, unit string, err error) {
 	case "B", "kB", "MB", "GB", "TB", "1kB", "2kB", "4kB", "8kB", "16kB", "32kB", "64kB", "16MB", "32MB", "64MB":
 		unit = "bytes"
 	default:
-		err = fmt.Errorf("Unknown unit for runtime variable: %q", s.unit)
+		err = fmt.Errorf("unknown unit for runtime variable: %q", s.unit)
 		return
 	}
 

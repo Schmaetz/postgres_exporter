@@ -11,27 +11,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package exporter
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/lib/pq"
 )
-
-func contains(a []string, x string) bool {
-	for _, n := range a {
-		if x == n {
-			return true
-		}
-	}
-	return false
-}
 
 // convert a string to the corresponding ColumnUsage
 func stringToColumnUsage(s string) (ColumnUsage, error) {
@@ -68,7 +58,7 @@ func stringToColumnUsage(s string) (ColumnUsage, error) {
 
 // Convert database.sql types to float64s for Prometheus consumption. Null types are mapped to NaN. string and []byte
 // types are mapped as NaN and !ok
-func dbToFloat64(t interface{}) (float64, bool) {
+func dbToFloat64(t interface{}, logger *slog.Logger) (float64, bool) {
 	switch v := t.(type) {
 	case int64:
 		return float64(v), true
@@ -106,7 +96,7 @@ func dbToFloat64(t interface{}) (float64, bool) {
 
 // Convert database.sql types to uint64 for Prometheus consumption. Null types are mapped to 0. string and []byte
 // types are mapped as 0 and !ok
-func dbToUint64(t interface{}) (uint64, bool) {
+func dbToUint64(t interface{}, logger *slog.Logger) (uint64, bool) {
 	switch v := t.(type) {
 	case uint64:
 		return v, true
@@ -159,7 +149,7 @@ func dbToString(t interface{}) (string, bool) {
 		// Try and convert to string
 		return string(v), true
 	case string:
-		return v, true
+		return strings.ToValidUTF8(v, "�"), true
 	case bool:
 		if v {
 			return "true", true
@@ -170,10 +160,27 @@ func dbToString(t interface{}) (string, bool) {
 	}
 }
 
-func parseFingerprint(url string) (string, error) {
-	dsn, err := pq.ParseURL(url)
-	if err != nil {
-		dsn = url
+func parseFingerprint(dsn string) (string, error) {
+	// Only postgres:// and postgresql:// are valid DSN URL schemes; anything
+	// else (e.g. a key=value DSN like "host=example port=1234") falls through
+	// to the key=value parser below.
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("malformed dsn %q", dsn)
+		}
+
+		host := u.Hostname()
+		if host == "" {
+			host = "localhost"
+		}
+
+		port := u.Port()
+		if port == "" {
+			port = "5432"
+		}
+
+		return host + ":" + port, nil
 	}
 
 	pairs := strings.Split(dsn, " ")
@@ -183,7 +190,6 @@ func parseFingerprint(url string) (string, error) {
 		if len(splitted) != 2 {
 			return "", fmt.Errorf("malformed dsn %q", dsn)
 		}
-		// Newer versions of pq.ParseURL quote values so trim them off if they exist
 		key := strings.Trim(splitted[0], "'\"")
 		value := strings.Trim(splitted[1], "'\"")
 		kv[key] = value

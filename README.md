@@ -1,13 +1,14 @@
-[![Build Status](https://circleci.com/gh/prometheus-community/postgres_exporter.svg?style=svg)](https://circleci.com/gh/prometheus-community/postgres_exporter)
+# PostgreSQL Server Exporter
+
+[![Build Status](https://github.com/prometheus-community/postgres_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/prometheus-community/postgres_exporter/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/prometheus-community/postgres_exporter/badge.svg?branch=master)](https://coveralls.io/github/prometheus-community/postgres_exporter?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/prometheus-community/postgres_exporter)](https://goreportcard.com/report/github.com/prometheus-community/postgres_exporter)
 [![Docker Pulls](https://img.shields.io/docker/pulls/prometheuscommunity/postgres-exporter.svg)](https://hub.docker.com/r/prometheuscommunity/postgres-exporter/tags)
 
-# PostgreSQL Server Exporter
 
 Prometheus exporter for PostgreSQL server metrics.
 
-CI Tested PostgreSQL versions: `11`, `12`, `13`, `14`, `15`, `16`
+CI Tested PostgreSQL versions: `13`, `14`, `15`, `16`, `17`, `18`.
 
 ## Quick Start
 This package is available for Docker:
@@ -132,20 +133,53 @@ This will build the docker image as `prometheuscommunity/postgres_exporter:${bra
 * `[no-]collector.replication`
   Enable the `replication` collector (default: enabled).
 
-* `[no-]collector.replication_slot`
-  Enable the `replication_slot` collector (default: enabled).
+* `[no-]collector.replication_slots`
+  Enable the `replication_slots` collector (default: enabled).
+
+* `[no-]collector.settings`
+  Enable the `settings` collector (default: enabled).
+
+* `[no-]collector.stat_activity`
+  Enable the `stat_activity` collector (default: enabled).
 
 * `[no-]collector.stat_activity_autovacuum`
   Enable the `stat_activity_autovacuum` collector (default: disabled).
 
+* `[no-]collector.stat_archiver`
+  Enable the `stat_archiver` collector (default: enabled).
+
 * `[no-]collector.stat_bgwriter`
   Enable the `stat_bgwriter` collector (default: enabled).
+
+* `[no-]collector.stat_checkpointer`
+  Enable the `stat_checkpointer` collector (default: disabled).
 
 * `[no-]collector.stat_database`
   Enable the `stat_database` collector (default: enabled).
 
+* `[no-]collector.stat_progress_vacuum`
+  Enable the `stat_progress_vacuum` collector (default: enabled).
+
+* `[no-]collector.stat_replication`
+  Enable the `stat_replication` collector (default: enabled).
+
 * `[no-]collector.stat_statements`
   Enable the `stat_statements` collector (default: disabled).
+
+* `[no-]collector.stat_statements.include_query`
+  Enable selecting statement query together with queryId. (default: disabled)
+
+* `--collector.stat_statements.query_length`
+  Maximum length of the statement text. Default is 120.
+
+* `--collector.stat_statements.limit`
+  Maximum number of statements to return. Default is 100.
+
+* `--collector.stat_statements.exclude_databases`
+  Comma-separated list of database names to exclude from `pg_stat_statements` metrics. Default is none.
+
+* `--collector.stat_statements.exclude_users`
+  Comma-separated list of user names to exclude from `pg_stat_statements` metrics. Default is none.
 
 * `[no-]collector.stat_user_tables`
   Enable the `stat_user_tables` collector (default: enabled).
@@ -183,9 +217,6 @@ This will build the docker image as `prometheuscommunity/postgres_exporter:${bra
 
 * `disable-default-metrics`
   Use only metrics supplied from `queries.yaml` via `--extend.query-path`.  Default is `false`.
-
-* `disable-settings-metrics`
-  Use the flag if you don't want to scrape `pg_settings`.  Default is `false`.
 
 * `auto-discover-databases` (DEPRECATED)
   Whether to discover the databases on a server dynamically.  Default is `false`.
@@ -246,14 +277,19 @@ The following environment variables configure the exporter:
 * `DATA_SOURCE_PASS_FILE`
   The same as above but reads the password from a file.
 
+* `PG_EXPORTER_COLLECTION_TIMEOUT`
+  Timeout duration to use when collecting the statistics, default to `1m`.
+  When the timeout is reached, the database connection will be dropped.
+  It avoids connections stacking when the database answers too slowly
+  (for instance if the database creates/drop a huge table and locks the tables)
+  and will avoid exhausting the pool of connections of the database.
+  Value of `0` or less than `1ms` is considered invalid and will report an error.
+
 * `PG_EXPORTER_WEB_TELEMETRY_PATH`
   Path under which to expose metrics. Default is `/metrics`.
 
 * `PG_EXPORTER_DISABLE_DEFAULT_METRICS`
   Use only metrics supplied from `queries.yaml`. Value can be `true` or `false`. Default is `false`.
-
-* `PG_EXPORTER_DISABLE_SETTINGS_METRICS`
-  Use the flag if you don't want to scrape `pg_settings`. Value can be `true` or `false`. Default is `false`.
 
 * `PG_EXPORTER_AUTO_DISCOVER_DATABASES` (DEPRECATED)
   Whether to discover the databases on a server dynamically. Value can be `true` or `false`. Default is `false`.

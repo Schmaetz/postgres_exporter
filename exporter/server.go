@@ -11,16 +11,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package exporter
 
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/promslog"
 )
 
 // Server describes a connection to Postgres.
@@ -42,6 +44,7 @@ type Server struct {
 	// Currently cached metrics
 	metricCache map[string]cachedMetrics
 	cacheMtx    sync.Mutex
+	logger      *slog.Logger
 }
 
 // ServerOpt configures a server.
@@ -53,6 +56,12 @@ func ServerWithLabels(labels prometheus.Labels) ServerOpt {
 		for k, v := range labels {
 			s.labels[k] = v
 		}
+	}
+}
+
+func ServerWithLogger(logger *slog.Logger) ServerOpt {
+	return func(s *Server) {
+		s.logger = logger
 	}
 }
 
@@ -70,8 +79,6 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	logger.Info("Established new database connection", "fingerprint", fingerprint)
-
 	s := &Server{
 		db:     db,
 		master: false,
@@ -79,11 +86,14 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 			serverLabelName: fingerprint,
 		},
 		metricCache: make(map[string]cachedMetrics),
+		logger:      promslog.NewNopLogger(),
 	}
 
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	s.logger.Info("Established new database connection", "fingerprint", fingerprint)
 
 	return s, nil
 }
@@ -97,7 +107,7 @@ func (s *Server) Close() error {
 func (s *Server) Ping() error {
 	if err := s.db.Ping(); err != nil {
 		if cerr := s.Close(); cerr != nil {
-			logger.Error("Error while closing non-pinging DB connection", "server", s, "err", cerr)
+			s.logger.Error("Error while closing non-pinging DB connection", "server", s, "err", cerr)
 		}
 		return err
 	}
@@ -110,21 +120,19 @@ func (s *Server) String() string {
 }
 
 // Scrape loads metrics.
-func (s *Server) Scrape(ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
+func (s *Server) Scrape(ch chan<- prometheus.Metric) error {
 	s.mappingMtx.RLock()
 	defer s.mappingMtx.RUnlock()
 
 	var err error
 
-	if !disableSettingsMetrics && s.master {
-		if err = querySettings(ch, s); err != nil {
-			err = fmt.Errorf("error retrieving settings: %s", err)
-		}
-	}
-
 	errMap := queryNamespaceMappings(ch, s)
-	if len(errMap) > 0 {
-		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
+	if len(errMap) == 0 {
+		return nil
+	}
+	err = fmt.Errorf("queryNamespaceMappings errors encountered")
+	for namespace, errStr := range errMap {
+		err = fmt.Errorf("%s, namespace: %s error: %s", err, namespace, errStr)
 	}
 
 	return err
@@ -168,6 +176,7 @@ func (s *Servers) GetServer(dsn string) (*Server, error) {
 			s.servers[dsn] = server
 		}
 		if err = server.Ping(); err != nil {
+			server.Close()
 			delete(s.servers, dsn)
 			time.Sleep(time.Duration(errCount) * time.Second)
 			continue
@@ -183,7 +192,7 @@ func (s *Servers) Close() {
 	defer s.m.Unlock()
 	for _, server := range s.servers {
 		if err := server.Close(); err != nil {
-			logger.Error("Failed to close connection", "server", server, "err", err)
+			server.logger.Error("Failed to close connection", "server", server, "err", err)
 		}
 	}
 }
